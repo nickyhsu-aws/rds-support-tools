@@ -323,30 +323,72 @@ fi
 # Check if installed extensions need to be updated before upgrade
 # --------------------------------------------
 echo ""
-echo "=== A-9. check_for_multi_extensions_version ==="
+echo "=== A-9. check_all_extensions_version ==="
 A9_FAILED=0
-MULTI_EXTENSIONS="postgis pgrouting postgis_raster postgis_tiger_geocoder postgis_topology address_standardizer address_standardizer_data_us rdkit"
 for db in $DBS; do
-    for ext in $MULTI_EXTENSIONS; do
-        result=$($PSQL -d "$db" -t -A -c "
-            SELECT name || '|' || installed_version || '|' || default_version 
-            FROM pg_available_extensions 
-            WHERE name = '$ext' 
-              AND installed_version IS NOT NULL 
-              AND default_version != installed_version;" 2>/dev/null)
-        if [ -n "$result" ]; then
-            ext_name=$(echo "$result" | cut -d'|' -f1)
-            installed_ver=$(echo "$result" | cut -d'|' -f2)
-            default_ver=$(echo "$result" | cut -d'|' -f3)
+    result=$($PSQL -d "$db" -t -A -c "
+        SELECT name || '|' || installed_version || '|' || default_version 
+        FROM pg_available_extensions 
+        WHERE installed_version IS NOT NULL 
+            AND default_version != installed_version;" 2>/dev/null)
+
+    if [ -n "$result" ]; then
+        while IFS='|' read -r ext_name installed_ver default_ver; do
             echo "⚠️ WARN [$db]: $ext_name installed: $installed_ver, available: $default_ver"
             echo "   You can either drop the extension or upgrade the extension and try the upgrade again."
             ((WARNS++))
-            A9_FAILED=1
-        fi
-    done
+        done <<< "$result"
+        A9_FAILED=1
+    fi
 done
-[ "$A9_FAILED" -eq 1 ] && WARN_CHECKS+=("A-9. check_for_multi_extensions_version")
+[ "$A9_FAILED" -eq 1 ] && WARN_CHECKS+=("A-9. check_all_extensions_version")
 [ "$A9_FAILED" -eq 0 ] && echo "✓ OK"
+
+# --------------------------------------------
+# A-10. check_transaction_id_age
+# --------------------------------------------
+echo ""
+echo "=== A-10. check_transaction_id_age ==="
+result=$($PSQL -d postgres -t -A -c "
+SELECT datname, age(datfrozenxid)
+FROM pg_database
+WHERE age(datfrozenxid) > 200000000
+ORDER BY age(datfrozenxid) DESC;")
+if [ -n "$result" ]; then
+    echo "❌ ERROR: Database(s) with high transaction ID age (>200M)"
+    echo "   Anti-wraparound autovacuum is being triggered. Run VACUUM FREEZE before upgrade to avoid upgrade failure."
+    $PSQL -d postgres -c "
+    SELECT datname AS database_name,
+           age(datfrozenxid) AS xid_age
+    FROM pg_database
+    WHERE age(datfrozenxid) > 200000000
+    ORDER BY age(datfrozenxid) DESC;"
+    ((ERRORS++))
+    FAILED_CHECKS+=("A-10. check_transaction_id_age")
+else
+    echo "✓ OK"
+fi
+
+# --------------------------------------------
+# A-11. check_large_objects
+# --------------------------------------------
+echo ""
+echo "=== A-11. check_large_objects ==="
+A11_FAILED=0
+for db in $DBS; do
+    lo_count=$($PSQL -d "$db" -t -A -c "SELECT COUNT(*) FROM pg_largeobject_metadata;" 2>/dev/null)
+    if [ "${lo_count:-0}" -gt 5 ]; then
+        echo "⚠️ WARN [$db]: $lo_count large objects found (>1M)"
+        echo "   Excessive large objects can cause OOM during upgrade."
+        echo "   Consider larger instance class or cleanup before upgrade."
+        lo_size=$($PSQL -d "$db" -t -A -c "SELECT pg_size_pretty(pg_total_relation_size('pg_largeobject'));" 2>/dev/null)
+        echo "   Large object table size: ${lo_size:-unknown}"
+        ((WARNS++))
+        A11_FAILED=1
+    fi
+done
+[ "$A11_FAILED" -eq 1 ] && WARN_CHECKS+=("A-11. check_large_objects")
+[ "$A11_FAILED" -eq 0 ] && echo "✓ OK"
 
 # ============================================
 # SECTION 2: Engine Checks (pg_upgrade_internal.log)
@@ -792,6 +834,120 @@ if [ "$BG_DEPLOY" = "yes" ] || [ "$BG_DEPLOY" = "y" ]; then
     done
     [ "$BG6_FAILED" -eq 1 ] && FAILED_CHECKS+=("BG-6. DTS trigger")
     [ "$BG6_FAILED" -eq 0 ] && echo "✓ OK"
+
+    # --------------------------------------------
+    # BG-7. Check for foreign tables
+    # --------------------------------------------
+    echo ""
+    echo "=== BG-7. Check for foreign tables ==="
+    BG7_WARN=0
+    for db in $DBS; do
+        ft_count=$($PSQL -d "$db" -t -A -c "
+        SELECT count(*) FROM information_schema.foreign_tables;" 2>/dev/null)
+        if [ "${ft_count:-0}" -gt 0 ]; then
+            echo "⚠️ WARN [$db]: $ft_count foreign table(s) found will NOT be replicated to green"
+            $PSQL -d "$db" -c "
+            SELECT foreign_table_schema, foreign_table_name, foreign_server_name
+            FROM information_schema.foreign_tables
+            ORDER BY foreign_table_schema, foreign_table_name;"
+            ((WARNS++))
+            BG7_WARN=1
+        fi
+    done
+    [ "$BG7_WARN" -eq 1 ] && WARN_CHECKS+=("BG-7. Foreign tables")
+    [ "$BG7_WARN" -eq 0 ] && echo "✓ OK"
+
+    # --------------------------------------------
+    # BG-8. Check for unlogged tables
+    # --------------------------------------------
+    echo ""
+    echo "=== BG-8. Check for unlogged tables ==="
+    BG8_WARN=0
+    for db in $DBS; do
+        ul_count=$($PSQL -d "$db" -t -A -c "
+        SELECT count(*) FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relpersistence = 'u'
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND n.nspname NOT LIKE 'pg_toast%';" 2>/dev/null)
+        if [ "${ul_count:-0}" -gt 0 ]; then
+            echo "⚠️ WARN [$db]: $ul_count unlogged table(s) found will NOT be replicated to green"
+            $PSQL -d "$db" -c "
+            SELECT n.nspname AS schema_name, c.relname AS table_name,
+                   pg_size_pretty(pg_total_relation_size(c.oid)) AS table_size
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relpersistence = 'u'
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND n.nspname NOT LIKE 'pg_toast%'
+            ORDER BY pg_total_relation_size(c.oid) DESC;"
+            echo "  Note (RDS PostgreSQL): Unlogged tables are not replicated to the green environment."
+            echo "  Note (Aurora PostgreSQL): Unlogged tables are not replicated unless"
+            echo "    rds.logically_replicate_unlogged_tables = 1 on the blue DB cluster."
+            echo "    Do NOT modify this parameter after creating a blue/green deployment."
+            ((WARNS++))
+            BG8_WARN=1
+        fi
+    done
+    [ "$BG8_WARN" -eq 1 ] && WARN_CHECKS+=("BG-8. Unlogged tables")
+    [ "$BG8_WARN" -eq 0 ] && echo "✓ OK"
+
+    # --------------------------------------------
+    # BG-9. Check for publications
+    # --------------------------------------------
+    echo ""
+    echo "=== BG-9. Check for publications ==="
+    BG9_FAILED=0
+    for db in $DBS; do
+        pub_count=$($PSQL -d "$db" -t -A -c "SELECT count(*) FROM pg_publication;" 2>/dev/null)
+        if [ "${pub_count:-0}" -gt 0 ]; then
+            echo "❌ ERROR [$db]: $pub_count publication(s) exist, blue cannot be a logical publisher"
+            $PSQL -d "$db" -c "
+            SELECT pubname AS publication_name,
+                   puballtables AS publishes_all_tables
+            FROM pg_publication;"
+            echo "  Action: Drop publications before creating Blue/Green deployment."
+            ((ERRORS++))
+            BG9_FAILED=1
+        fi
+    done
+    [ "$BG9_FAILED" -eq 1 ] && FAILED_CHECKS+=("BG-9. Publications")
+    [ "$BG9_FAILED" -eq 0 ] && echo "✓ OK"
+
+    # --------------------------------------------
+    # BG-10. Check BG extension compatibility
+    # --------------------------------------------
+    echo ""
+    echo "=== BG-10. Check BG extension compatibility ==="
+    BG10_FAILED=0
+    for db in $DBS; do
+        result=$($PSQL -d "$db" -t -A -c "
+        SELECT extname FROM pg_extension
+        WHERE extname IN ('pg_partman', 'pg_cron', 'pglogical', 'pgactive');" 2>/dev/null)
+        if [ -n "$result" ]; then
+            echo "❌ ERROR [$db]: BG-incompatible extension(s) found:"
+            for ext in $result; do
+                case "$ext" in
+                    pg_partman)
+                        echo "   - pg_partman: Must be DISABLED before BG deployment (DDL breaks logical replication)"
+                        ;;
+                    pg_cron)
+                        echo "   - pg_cron: Must remain DISABLED on green databases (bypasses read-only)"
+                        ;;
+                    pglogical)
+                        echo "   - pglogical: Must be DISABLED before BG deployment"
+                        ;;
+                    pgactive)
+                        echo "   - pgactive: Must be DISABLED before BG deployment"
+                        ;;
+                esac
+            done
+            ((ERRORS++))
+            BG10_FAILED=1
+        fi
+    done
+    [ "$BG10_FAILED" -eq 1 ] && FAILED_CHECKS+=("BG-10. BG extension compatibility")
+    [ "$BG10_FAILED" -eq 0 ] && echo "✓ OK"
 fi
 
 # ============================================
