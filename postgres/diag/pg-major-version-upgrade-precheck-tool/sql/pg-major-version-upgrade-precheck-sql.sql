@@ -17,7 +17,7 @@
 -- ============================================
 -- Aurora/RDS PostgreSQL Major Version Upgrade Precheck
 -- SQL Version
--- Supports: Target Major Version 11-17
+-- Supports: Target Major Version 11-18
 --
 -- Each check is either:
 --   [global]       - Run once against the postgres database
@@ -117,10 +117,13 @@ SELECT
   (current_setting('server_version_num')::int / 10000 < 17)::text                AS need_slot_check,
   (:target_version >= 11)::text                                                   AS target_ge_11,
   (:target_version >= 14)::text                                                   AS target_ge_14,
+  (:target_version >= 18)::text                                                   AS target_ge_18,
+  (current_setting('server_version_num')::int / 10000 >= 17)::text               AS source_ge_17,
   (current_setting('server_version_num')::int / 10000 <= 15
      AND :target_version >= 16)::text                                             AS need_aclitem_check,
   (current_setting('server_version_num')::int / 10000 <= 11)::text               AS source_le_11,
-  (current_setting('server_version_num')::int / 10000 <= 13)::text               AS source_le_13
+  (current_setting('server_version_num')::int / 10000 <= 13)::text               AS source_le_13,
+  (to_regproc('aurora_version') IS NOT NULL)::text                               AS is_aurora
 \gset
 
 -- Version sanity check
@@ -130,11 +133,21 @@ SELECT
 \endif
 
 -- ============================================
--- Validate target_version is within supported range (11-17)
+-- Validate target_version is within supported range (11-18)
 -- ============================================
-SELECT (:target_version < 11 OR :target_version > 17)::text AS version_out_of_range \gset
+SELECT (:target_version < 11 OR :target_version > 18)::text AS version_out_of_range \gset
 \if :version_out_of_range
-    \echo '❌ FAILED: target_version must be between 11 and 17.'
+    \echo '❌ FAILED: target_version must be between 11 and 18.'
+    \quit
+\endif
+
+-- ============================================
+-- Aurora PostgreSQL does not yet support target version 18
+-- ============================================
+SELECT (to_regproc('aurora_version') IS NOT NULL AND :target_version >= 18)::text AS aurora_target_invalid \gset
+\if :aurora_target_invalid
+    \echo '❌ FAILED: Aurora PostgreSQL does not support target version 18 yet.'
+    \echo '   Supported target versions for Aurora PostgreSQL: 11-17'
     \quit
 \endif
 
@@ -478,7 +491,7 @@ WHERE state != 'idle'
     \endif
 \else
     SELECT 'false' AS c13_failed, '- SKIP' AS c13_status \gset
-    \echo '- Skipped (APG 17+ supports logical slot migration)'
+    \echo '- Skipped (PG 17+ supports logical slot migration)'
 \endif
 
 \echo ''
@@ -1824,6 +1837,409 @@ FROM (
 
 \echo ''
 
+-- --------------------------------------------
+-- Check 47. check_old_cluster_for_valid_slots - invalid slots [global]
+-- (source >= 17; logical slot migration requires valid slots)
+-- (Skipped for Aurora PostgreSQL - Aurora handles slot migration internally)
+-- --------------------------------------------
+\echo '=== 47. check_old_cluster_for_valid_slots - invalid slots [global] ==='
+\if :is_aurora
+    SELECT 'false' AS c47_failed \gset
+    \echo '- Skipped (Aurora PostgreSQL - not applicable)'
+\elif :source_ge_17
+    SELECT (count(*) > 0)::text AS c47_failed,
+           CASE WHEN count(*) > 0
+                THEN '❌ FAILED: ' || count(*) || ' invalidated logical slot(s). Drop them before upgrade.'
+                ELSE '✓ PASSED'
+           END AS c47_status
+    FROM pg_catalog.pg_replication_slots
+    WHERE slot_type = 'logical'
+      AND temporary = false
+      AND invalidation_reason IS NOT NULL \gset
+
+    \echo :c47_status
+
+    \if :c47_failed
+        SELECT slot_name, plugin, database, invalidation_reason
+        FROM pg_catalog.pg_replication_slots
+        WHERE slot_type = 'logical'
+          AND temporary = false
+          AND invalidation_reason IS NOT NULL;
+    \endif
+\else
+    SELECT 'false' AS c47_failed, '- SKIP' AS c47_status \gset
+    \echo '- Skipped (source version < 17; logical slot migration not applicable)'
+\endif
+
+\echo ''
+
+-- --------------------------------------------
+-- Check 47b. check_old_cluster_for_valid_slots - unconsumed WAL [global]
+-- (source >= 17; inactive slots must have consumed all WAL before shutdown)
+-- --------------------------------------------
+\echo '=== 47b. check_old_cluster_for_valid_slots - unconsumed WAL [global] ==='
+\if :is_aurora
+    SELECT 'false' AS c47b_failed \gset
+    \echo '- Skipped (Aurora PostgreSQL - not applicable)'
+\elif :source_ge_17
+    SELECT (count(*) > 0)::text AS c47b_failed,
+           CASE WHEN count(*) > 0
+                THEN '❌ FAILED: ' || count(*) || ' inactive logical slot(s) with unconsumed WAL. '
+                     || 'After shutdown, pg_upgrade will reject these. '
+                     || 'Either consume pending WAL or drop the slot(s).'
+                ELSE '✓ PASSED'
+           END AS c47b_status
+    FROM pg_catalog.pg_replication_slots
+    WHERE slot_type = 'logical'
+      AND temporary = false
+      AND active = false
+      AND invalidation_reason IS NULL
+      AND confirmed_flush_lsn < pg_current_wal_insert_lsn() \gset
+
+    \echo :c47b_status
+
+    \if :c47b_failed
+        SELECT slot_name, plugin, database,
+               confirmed_flush_lsn,
+               pg_current_wal_insert_lsn() AS current_wal_insert_lsn,
+               pg_size_pretty(pg_current_wal_insert_lsn() - confirmed_flush_lsn) AS wal_lag
+        FROM pg_catalog.pg_replication_slots
+        WHERE slot_type = 'logical'
+          AND temporary = false
+          AND active = false
+          AND invalidation_reason IS NULL
+          AND confirmed_flush_lsn < pg_current_wal_insert_lsn();
+    \endif
+\else
+    SELECT 'false' AS c47b_failed, '- SKIP' AS c47b_status \gset
+    \echo '- Skipped (source version < 17)'
+\endif
+
+\echo ''
+
+-- --------------------------------------------
+-- Check 47c. check_old_cluster_for_valid_slots - active slots with lag [global]
+-- (source >= 17; WARNING only - active slots with WAL lag may fail
+-- --------------------------------------------
+\echo '=== 47c. check_old_cluster_for_valid_slots - active slots with WAL lag [global] ==='
+\if :is_aurora
+    SELECT 'false' AS c47c_failed \gset
+    \echo '- Skipped (Aurora PostgreSQL - not applicable)'
+\elif :source_ge_17
+    SELECT (count(*) > 0)::text AS c47c_failed,
+           CASE WHEN count(*) > 0
+                THEN '⚠️ WARNING: ' || count(*) || ' active logical slot(s) with WAL lag. '
+                     || 'Ensure consumers are caught up before stopping the instance for upgrade.'
+                ELSE '✓ PASSED'
+           END AS c47c_status
+    FROM pg_catalog.pg_replication_slots
+    WHERE slot_type = 'logical'
+      AND temporary = false
+      AND active = true
+      AND invalidation_reason IS NULL
+      AND confirmed_flush_lsn < pg_current_wal_insert_lsn() \gset
+
+    \echo :c47c_status
+
+    \if :c47c_failed
+        SELECT slot_name, plugin, database,
+               confirmed_flush_lsn,
+               pg_current_wal_insert_lsn() AS current_wal_insert_lsn,
+               pg_size_pretty(pg_current_wal_insert_lsn() - confirmed_flush_lsn) AS wal_lag
+        FROM pg_catalog.pg_replication_slots
+        WHERE slot_type = 'logical'
+          AND temporary = false
+          AND active = true
+          AND invalidation_reason IS NULL
+          AND confirmed_flush_lsn < pg_current_wal_insert_lsn();
+    \endif
+
+    -- Info: show all logical slots
+    \echo '  --- All logical slots (info) ---'
+    SELECT slot_name, plugin, database, active, wal_status,
+           confirmed_flush_lsn,
+           pg_current_wal_insert_lsn() AS current_wal_insert_lsn
+    FROM pg_catalog.pg_replication_slots
+    WHERE slot_type = 'logical'
+    ORDER BY slot_name;
+\else
+    SELECT 'false' AS c47c_failed, '- SKIP' AS c47c_status \gset
+    \echo '- Skipped (source version < 17)'
+\endif
+
+\echo ''
+
+-- --------------------------------------------
+-- Check 48. check_old_cluster_subscription_state [per-database]
+-- (source >= 17; subscription relations must be in 'i' or 'r' state,
+--  and each subscription must have a replication origin)
+-- --------------------------------------------
+\echo '=== 48. check_old_cluster_subscription_state [per-database] ==='
+\if :is_aurora
+    SELECT 'false' AS c48_failed \gset
+    \echo '- Skipped (Aurora PostgreSQL - not applicable)'
+\elif :source_ge_17
+    SELECT (count(*) > 0)::text AS c48_failed,
+           CASE WHEN count(*) > 0
+                THEN '❌ FAILED: ' || count(*) || ' subscription issue(s) found. Fix before upgrade.'
+                ELSE '✓ PASSED'
+           END AS c48_status
+    FROM (
+        -- Subscriptions missing replication origin
+        SELECT s.subname AS item
+        FROM pg_catalog.pg_subscription s
+        LEFT JOIN pg_catalog.pg_replication_origin o
+               ON o.roname = 'pg_' || s.oid::text
+        WHERE o.roname IS NULL
+        UNION ALL
+        -- Subscription relations not in i/r state
+        SELECT s.subname || '.' || c.relname
+        FROM pg_catalog.pg_subscription_rel r
+        JOIN pg_catalog.pg_subscription s ON r.srsubid = s.oid
+        JOIN pg_catalog.pg_class c        ON r.srrelid = c.oid
+        WHERE r.srsubstate NOT IN ('i', 'r')
+    ) sub \gset
+
+    \echo :c48_status
+
+    \if :c48_failed
+        -- Subscriptions missing origin
+        SELECT s.subname AS subscription, '(missing replication origin)' AS issue
+        FROM pg_catalog.pg_subscription s
+        LEFT JOIN pg_catalog.pg_replication_origin o
+               ON o.roname = 'pg_' || s.oid::text
+        WHERE o.roname IS NULL
+        ORDER BY s.subname;
+
+        -- Relations in unsupported state
+        SELECT s.subname AS subscription,
+               n.nspname AS schema,
+               c.relname AS relation,
+               r.srsubstate AS state
+        FROM pg_catalog.pg_subscription_rel r
+        JOIN pg_catalog.pg_subscription s ON r.srsubid = s.oid
+        JOIN pg_catalog.pg_class c        ON r.srrelid = c.oid
+        JOIN pg_catalog.pg_namespace n    ON c.relnamespace = n.oid
+        WHERE r.srsubstate NOT IN ('i', 'r')
+        ORDER BY s.subname, n.nspname, c.relname;
+    \endif
+\else
+    SELECT 'false' AS c48_failed, '- SKIP' AS c48_status \gset
+    \echo '- Skipped (source version < 17)'
+\endif
+
+\echo ''
+
+-- --------------------------------------------
+-- Check 49. check_for_isn_and_int8_passing_mismatch [per-database]
+-- --------------------------------------------
+\echo '=== 49. check_for_isn_and_int8_passing_mismatch [per-database] ==='
+\if :is_aurora
+    SELECT 'false' AS c49_failed \gset
+    \echo '- Skipped (Aurora PostgreSQL - not applicable)'
+\else
+SELECT (count(*) > 0)::text AS c49_failed,
+       CASE WHEN count(*) > 0
+            THEN '⚠️ WARNING: ' || count(*) || ' contrib/isn function(s) found. ' ||
+                 'If old/new clusters disagree on float8_pass_by_value, pg_upgrade will fail. ' ||
+                 'On RDS this is normally consistent, but verify before upgrading.'
+            ELSE '✓ PASSED'
+       END AS c49_status
+FROM pg_catalog.pg_proc p
+WHERE p.probin = '$libdir/isn' \gset
+
+\echo :c49_status
+
+\if :c49_failed
+    SELECT n.nspname AS schema, p.proname AS function_name
+    FROM pg_catalog.pg_proc p
+    JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
+    WHERE p.probin = '$libdir/isn'
+    ORDER BY n.nspname, p.proname;
+\endif
+\endif
+
+\echo ''
+
+-- --------------------------------------------
+-- Check 50. check_for_not_null_inheritance [per-database]
+-- (PG18 new; target >= 18)
+-- Child tables must not omit NOT NULL constraints that parents have.
+-- --------------------------------------------
+\echo '=== 50. check_for_not_null_inheritance [per-database] ==='
+\if :is_aurora
+    SELECT 'false' AS c50_failed \gset
+    \echo '- Skipped (Aurora PostgreSQL - not applicable)'
+\elif :target_ge_18
+    SELECT (count(*) > 0)::text AS c50_failed,
+           CASE WHEN count(*) > 0
+                THEN '❌ FAILED: ' || count(*) || ' child column(s) missing NOT NULL inherited from parent. ' ||
+                     'Run ALTER TABLE child ALTER col SET NOT NULL on each.'
+                ELSE '✓ PASSED'
+           END AS c50_status
+    FROM pg_catalog.pg_inherits i
+    JOIN pg_catalog.pg_attribute ac ON i.inhrelid  = ac.attrelid
+    JOIN pg_catalog.pg_attribute ap ON i.inhparent = ap.attrelid
+                                   AND ac.attname  = ap.attname
+    JOIN pg_catalog.pg_class cc     ON cc.oid = ac.attrelid
+    JOIN pg_catalog.pg_namespace nc ON nc.oid = cc.relnamespace
+    WHERE ap.attnum > 0
+      AND ap.attnotnull
+      AND NOT ac.attnotnull \gset
+
+    \echo :c50_status
+
+    \if :c50_failed
+        SELECT nc.nspname AS schema, cc.relname AS child_table, ac.attname AS column_name
+        FROM pg_catalog.pg_inherits i
+        JOIN pg_catalog.pg_attribute ac ON i.inhrelid  = ac.attrelid
+        JOIN pg_catalog.pg_attribute ap ON i.inhparent = ap.attrelid
+                                       AND ac.attname  = ap.attname
+        JOIN pg_catalog.pg_class cc     ON cc.oid = ac.attrelid
+        JOIN pg_catalog.pg_namespace nc ON nc.oid = cc.relnamespace
+        WHERE ap.attnum > 0
+          AND ap.attnotnull
+          AND NOT ac.attnotnull
+        ORDER BY nc.nspname, cc.relname, ac.attname;
+    \endif
+\else
+    SELECT 'false' AS c50_failed, '- SKIP' AS c50_status \gset
+    \echo '- Skipped (only applicable when target >= 18)'
+\endif
+
+\echo ''
+
+-- --------------------------------------------
+-- Check 51. check_for_unicode_update [per-database]
+-- (PG18 new; source >= 17 and target >= 18)
+-- WARNING only - does not block pg_upgrade.
+-- Surfaces indexes/partitions/constraints/matviews that use
+-- Unicode-dependent functions which may produce different results
+-- if the Unicode version changed between old and new clusters.
+-- --------------------------------------------
+\echo '=== 51. check_for_unicode_update [per-database] ==='
+\if :is_aurora
+    SELECT 'false' AS c51_failed \gset
+    \echo '- Skipped (Aurora PostgreSQL - not applicable)'
+\else
+SELECT (:source_ge_17 = 'true' AND :target_ge_18 = 'true')::text AS need_c51 \gset
+\if :need_c51
+    WITH
+    coll_dependent_funcs AS (
+        SELECT p.oid
+        FROM pg_catalog.pg_proc p
+        JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
+        WHERE n.nspname = 'pg_catalog'
+          AND ( p.proname IN ('normalize','unicode_assigned',
+                              'unicode_version','is_normalized',
+                              'lower','upper','initcap','casefold')
+             OR p.proname LIKE 'regexp_%' )
+    ),
+    coll_dependent_ops AS (
+        SELECT op.oid
+        FROM pg_catalog.pg_operator op
+        JOIN pg_catalog.pg_namespace n ON op.oprnamespace = n.oid
+        WHERE n.nspname = 'pg_catalog'
+          AND op.oprname IN ('~','~*','!~','!~*','~~*','!~~*')
+    ),
+    affected AS (
+        SELECT ix.indexrelid AS reloid
+        FROM pg_catalog.pg_index ix
+        WHERE EXISTS (
+            SELECT 1 FROM coll_dependent_funcs f
+            WHERE ix.indexprs::text LIKE '%:funcid ' || f.oid || ' %'
+               OR ix.indpred::text  LIKE '%:funcid ' || f.oid || ' %'
+        )
+        OR EXISTS (
+            SELECT 1 FROM coll_dependent_ops o
+            WHERE ix.indexprs::text LIKE '%:opno ' || o.oid || ' %'
+               OR ix.indpred::text  LIKE '%:opno ' || o.oid || ' %'
+        )
+        UNION ALL
+        SELECT pt.partrelid
+        FROM pg_catalog.pg_partitioned_table pt
+        WHERE EXISTS (
+            SELECT 1 FROM coll_dependent_funcs f
+            WHERE pt.partexprs::text LIKE '%:funcid ' || f.oid || ' %'
+        )
+        UNION ALL
+        SELECT co.conrelid
+        FROM pg_catalog.pg_constraint co
+        WHERE co.conbin IS NOT NULL
+          AND ( EXISTS (
+                  SELECT 1 FROM coll_dependent_funcs f
+                  WHERE co.conbin::text LIKE '%:funcid ' || f.oid || ' %')
+             OR EXISTS (
+                  SELECT 1 FROM coll_dependent_ops o
+                  WHERE co.conbin::text LIKE '%:opno ' || o.oid || ' %') )
+        UNION ALL
+        SELECT rw.ev_class
+        FROM pg_catalog.pg_rewrite rw
+        JOIN pg_catalog.pg_class c ON c.oid = rw.ev_class
+        WHERE c.relkind = 'm'
+          AND ( EXISTS (
+                  SELECT 1 FROM coll_dependent_funcs f
+                  WHERE rw.ev_action::text LIKE '%:funcid ' || f.oid || ' %')
+             OR EXISTS (
+                  SELECT 1 FROM coll_dependent_ops o
+                  WHERE rw.ev_action::text LIKE '%:opno ' || o.oid || ' %') )
+    )
+    SELECT (count(*) > 0)::text AS c51_failed,
+           CASE WHEN count(*) > 0
+                THEN '⚠️ WARNING: ' || count(*) || ' object(s) reference Unicode-dependent functions/operators. ' ||
+                     'If the Unicode version differs between old and new clusters, consider REINDEX or rebuilding affected objects after upgrade.'
+                ELSE '✓ PASSED'
+           END AS c51_status
+    FROM affected \gset
+
+    \echo :c51_status
+
+    \if :c51_failed
+        WITH
+        coll_dependent_funcs AS (
+            SELECT p.oid
+            FROM pg_catalog.pg_proc p
+            JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
+            WHERE n.nspname = 'pg_catalog'
+              AND ( p.proname IN ('normalize','unicode_assigned',
+                                  'unicode_version','is_normalized',
+                                  'lower','upper','initcap','casefold')
+                 OR p.proname LIKE 'regexp_%' )
+        ),
+        coll_dependent_ops AS (
+            SELECT op.oid
+            FROM pg_catalog.pg_operator op
+            JOIN pg_catalog.pg_namespace n ON op.oprnamespace = n.oid
+            WHERE n.nspname = 'pg_catalog'
+              AND op.oprname IN ('~','~*','!~','!~*','~~*','!~~*')
+        )
+        SELECT 'index'::text AS kind,
+               n.nspname AS schema,
+               c.relname AS table_name,
+               ic.relname AS index_name
+        FROM pg_catalog.pg_index ix
+        JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid
+        JOIN pg_catalog.pg_class c  ON c.oid  = ix.indrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE EXISTS (
+            SELECT 1 FROM coll_dependent_funcs f
+            WHERE ix.indexprs::text LIKE '%:funcid ' || f.oid || ' %'
+               OR ix.indpred::text  LIKE '%:funcid ' || f.oid || ' %')
+        OR EXISTS (
+            SELECT 1 FROM coll_dependent_ops o
+            WHERE ix.indexprs::text LIKE '%:opno ' || o.oid || ' %'
+               OR ix.indpred::text  LIKE '%:opno ' || o.oid || ' %')
+        ORDER BY n.nspname, c.relname, ic.relname
+        LIMIT 50;
+    \endif
+\else
+    SELECT 'false' AS c51_failed, '- SKIP' AS c51_status \gset
+    \echo '- Skipped (only meaningful when source >= 17 and target >= 18)'
+\endif
+\endif
+
+\echo ''
+
 -- ============================================
 -- Summary
 -- ============================================
@@ -1847,7 +2263,8 @@ FROM (VALUES
     ('36', :'c36_failed'), ('37', :'c37_failed'), ('38', :'c38_failed'),
     ('39', :'c39_failed'), ('39b', :'c39b_failed'), ('40', :'c40_failed'),
     ('41', :'c41_failed'), ('42', :'c42_failed'), ('43', :'c43_failed'),
-    ('44', :'c44_failed'), ('45', :'c45_failed'), ('46', :'c46_failed')
+    ('44', :'c44_failed'), ('45', :'c45_failed'), ('46', :'c46_failed'),
+    ('47', :'c47_failed'), ('47b', :'c47b_failed'), ('48', :'c48_failed'), ('50', :'c50_failed')
 ) AS t(check_name, failed)
 WHERE failed = 'true';
 
@@ -1865,7 +2282,9 @@ FROM (VALUES
     ('26', :'c26_failed'),
     ('27', :'c27_failed'), ('28', :'c28_failed'), ('29', :'c29_failed'),
     ('31', :'c31_failed'), ('32', :'c32_failed'), ('34', :'c34_failed'),
-    ('35', :'c35_failed'), ('35c', :'c35c_failed')
+    ('35', :'c35_failed'), ('35c', :'c35c_failed'),
+    ('47c', :'c47c_failed'),
+    ('49', :'c49_failed'), ('51', :'c51_failed')
 ) AS t(check_name, failed)
 WHERE failed = 'true';
 

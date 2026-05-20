@@ -2,7 +2,7 @@
 
 Run this tool before performing a Major Version Upgrade on RDS/Aurora PostgreSQL to detect common issues that may cause the upgrade to fail.
 
-Supported target versions: PostgreSQL 11 – 17
+Supported target versions: PostgreSQL 11 – 18
 
 > **Note:** These SQL scripts must be executed against each database individually. If you need automated execution across all databases in a cluster, use the [shell script version](https://github.com/awslabs/rds-support-tools/tree/main/postgres/diag/pg-major-version-upgrade-precheck-tool/shell) which iterates all user databases automatically.
 

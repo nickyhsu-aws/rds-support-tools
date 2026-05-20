@@ -17,7 +17,7 @@
 -- ============================================
 -- Aurora/RDS PostgreSQL Major Version Upgrade Precheck
 -- PL/pgSQL Version
--- Supports: Target Major Version 11-17
+-- Supports: Target Major Version 11-18
 --
 -- Each check is either:
 --   [global]       - Run once against the postgres database
@@ -96,9 +96,12 @@ DECLARE
     v_need_slot_check   boolean;
     v_target_ge_11      boolean;
     v_target_ge_14      boolean;
+    v_target_ge_18      boolean;
     v_need_aclitem_check boolean;
     v_source_le_11      boolean;
     v_source_le_13      boolean;
+    v_source_ge_17      boolean;
+    v_is_aurora         boolean;
 BEGIN
     -- Prevent runaway queries from holding catalog locks too long
     SET LOCAL statement_timeout = 600000;   -- 10 minutes
@@ -134,13 +137,21 @@ BEGIN
     v_need_slot_check    := (v_source_major < 17);
     v_target_ge_11       := (p_target_version >= 11);
     v_target_ge_14       := (p_target_version >= 14);
+    v_target_ge_18       := (p_target_version >= 18);
     v_need_aclitem_check := (v_source_major <= 15 AND p_target_version >= 16);
     v_source_le_11       := (v_source_major <= 11);
     v_source_le_13       := (v_source_major <= 13);
+    v_source_ge_17       := (v_source_major >= 17);
 
-    -- Validate target_version is within supported range (11-17)
-    IF p_target_version < 11 OR p_target_version > 17 THEN
-        RAISE EXCEPTION 'ERROR: Target version must be between 11 and 17. Got: %', p_target_version;
+    -- Validate target_version is within supported range (11-18)
+    IF p_target_version < 11 OR p_target_version > 18 THEN
+        RAISE EXCEPTION 'ERROR: Target version must be between 11 and 18. Got: %', p_target_version;
+    END IF;
+
+    -- Aurora PostgreSQL does not yet support target version 18
+    v_is_aurora := (to_regproc('aurora_version') IS NOT NULL);
+    IF v_is_aurora AND p_target_version >= 18 THEN
+        RAISE EXCEPTION 'ERROR: Aurora PostgreSQL does not support target version 18 yet. Supported: 11-17.';
     END IF;
 
     -- Version sanity check
@@ -503,7 +514,7 @@ BEGIN
         END IF;
     ELSE
         v_status := '- SKIP';
-        v_msg := 'Skipped (APG 17+ supports logical slot migration).';
+        v_msg := 'Skipped (PG 17+ supports logical slot migration).';
     END IF;
     RAISE NOTICE '%: %', v_status, v_msg;
     IF v_detail IS NOT NULL AND v_detail != '' THEN
@@ -1963,6 +1974,369 @@ BEGIN
         RAISE NOTICE '  Detail:'; RAISE NOTICE '    %', v_detail;
     END IF;
     check_id := '46'; check_scope := 'per-database'; status := v_status; message := v_msg; detail := v_detail;
+    RETURN NEXT;
+    RAISE NOTICE '';
+
+    -- --------------------------------------------
+    -- Check 47. check_old_cluster_for_valid_slots - invalid slots [global]
+    -- (source >= 17; logical slot migration requires valid slots)
+    -- --------------------------------------------
+    v_detail := '';
+    RAISE NOTICE '=== 47. check_old_cluster_for_valid_slots - invalid slots [global] ===';
+    IF v_is_aurora THEN
+        v_status := '- SKIP';
+        v_msg := 'Skipped (Aurora PostgreSQL - not applicable).';
+    ELSIF v_source_ge_17 THEN
+        SELECT count(*) INTO v_count
+        FROM pg_catalog.pg_replication_slots
+        WHERE slot_type = 'logical'
+          AND temporary = false
+          AND invalidation_reason IS NOT NULL;
+        IF v_count > 0 THEN
+            v_status := '❌ FAILED';
+            v_msg := v_count || ' invalidated logical slot(s). Drop them before upgrade.';
+            SELECT string_agg(slot_name || ' (reason: ' || invalidation_reason || ', db: ' || COALESCE(database, 'N/A') || ')', E'\n    ')
+            INTO v_detail
+            FROM pg_catalog.pg_replication_slots
+            WHERE slot_type = 'logical'
+              AND temporary = false
+              AND invalidation_reason IS NOT NULL;
+        ELSE
+            v_status := '✓ PASSED';
+            v_msg := 'No invalidated logical slots.';
+        END IF;
+    ELSE
+        v_status := '- SKIP';
+        v_msg := 'Skipped (source version < 17; logical slot migration not applicable).';
+    END IF;
+    RAISE NOTICE '%: %', v_status, v_msg;
+    IF v_detail IS NOT NULL AND v_detail != '' THEN
+        RAISE NOTICE '  Detail:'; RAISE NOTICE '    %', v_detail;
+    END IF;
+    check_id := '47'; check_scope := 'global'; status := v_status; message := v_msg; detail := v_detail;
+    RETURN NEXT;
+    RAISE NOTICE '';
+
+    -- --------------------------------------------
+    -- Check 47b. check_old_cluster_for_valid_slots - unconsumed WAL [global]
+    -- (source >= 17; inactive slots must have consumed all WAL before shutdown)
+    -- --------------------------------------------
+    v_detail := '';
+    RAISE NOTICE '=== 47b. check_old_cluster_for_valid_slots - unconsumed WAL [global] ===';
+    IF v_is_aurora THEN
+        v_status := '- SKIP';
+        v_msg := 'Skipped (Aurora PostgreSQL - not applicable).';
+    ELSIF v_source_ge_17 THEN
+        SELECT count(*) INTO v_count
+        FROM pg_catalog.pg_replication_slots
+        WHERE slot_type = 'logical'
+          AND temporary = false
+          AND active = false
+          AND invalidation_reason IS NULL
+          AND confirmed_flush_lsn < pg_current_wal_insert_lsn();
+        IF v_count > 0 THEN
+            v_status := '❌ FAILED';
+            v_msg := v_count || ' inactive logical slot(s) with unconsumed WAL. After shutdown, pg_upgrade will reject these. Either consume pending WAL or drop the slot(s).';
+            SELECT string_agg(slot_name || ' (db: ' || COALESCE(database, 'N/A') || ', lag: ' || pg_size_pretty(pg_current_wal_insert_lsn() - confirmed_flush_lsn) || ')', E'\n    ')
+            INTO v_detail
+            FROM pg_catalog.pg_replication_slots
+            WHERE slot_type = 'logical'
+              AND temporary = false
+              AND active = false
+              AND invalidation_reason IS NULL
+              AND confirmed_flush_lsn < pg_current_wal_insert_lsn();
+        ELSE
+            v_status := '✓ PASSED';
+            v_msg := 'No inactive slots with unconsumed WAL.';
+        END IF;
+    ELSE
+        v_status := '- SKIP';
+        v_msg := 'Skipped (source version < 17).';
+    END IF;
+    RAISE NOTICE '%: %', v_status, v_msg;
+    IF v_detail IS NOT NULL AND v_detail != '' THEN
+        RAISE NOTICE '  Detail:'; RAISE NOTICE '    %', v_detail;
+    END IF;
+    check_id := '47b'; check_scope := 'global'; status := v_status; message := v_msg; detail := v_detail;
+    RETURN NEXT;
+    RAISE NOTICE '';
+
+    -- --------------------------------------------
+    -- Check 47c. check_old_cluster_for_valid_slots - active slots with WAL lag [global]
+    -- (source >= 17; WARNING only)
+    -- --------------------------------------------
+    v_detail := '';
+    RAISE NOTICE '=== 47c. check_old_cluster_for_valid_slots - active slots with WAL lag [global] ===';
+    IF v_is_aurora THEN
+        v_status := '- SKIP';
+        v_msg := 'Skipped (Aurora PostgreSQL - not applicable).';
+    ELSIF v_source_ge_17 THEN
+        SELECT count(*) INTO v_count
+        FROM pg_catalog.pg_replication_slots
+        WHERE slot_type = 'logical'
+          AND temporary = false
+          AND active = true
+          AND invalidation_reason IS NULL
+          AND confirmed_flush_lsn < pg_current_wal_insert_lsn();
+        IF v_count > 0 THEN
+            v_status := '⚠️ WARNING';
+            v_msg := v_count || ' active logical slot(s) with WAL lag. Ensure consumers are caught up before stopping the instance for upgrade.';
+            SELECT string_agg(slot_name || ' (db: ' || COALESCE(database, 'N/A') || ', lag: ' || pg_size_pretty(pg_current_wal_insert_lsn() - confirmed_flush_lsn) || ')', E'\n    ')
+            INTO v_detail
+            FROM pg_catalog.pg_replication_slots
+            WHERE slot_type = 'logical'
+              AND temporary = false
+              AND active = true
+              AND invalidation_reason IS NULL
+              AND confirmed_flush_lsn < pg_current_wal_insert_lsn();
+        ELSE
+            v_status := '✓ PASSED';
+            v_msg := 'No active slots with concerning lag.';
+        END IF;
+    ELSE
+        v_status := '- SKIP';
+        v_msg := 'Skipped (source version < 17).';
+    END IF;
+    RAISE NOTICE '%: %', v_status, v_msg;
+    IF v_detail IS NOT NULL AND v_detail != '' THEN
+        RAISE NOTICE '  Detail:'; RAISE NOTICE '    %', v_detail;
+    END IF;
+    check_id := '47c'; check_scope := 'global'; status := v_status; message := v_msg; detail := v_detail;
+    RETURN NEXT;
+    RAISE NOTICE '';
+
+    -- --------------------------------------------
+    -- Check 48. check_old_cluster_subscription_state [per-database]
+    -- (source >= 17; subscription relations must be in 'i' or 'r' state,
+    --  and each subscription must have a replication origin)
+    -- --------------------------------------------
+    v_detail := '';
+    RAISE NOTICE '=== 48. check_old_cluster_subscription_state [per-database] ===';
+    IF v_is_aurora THEN
+        v_status := '- SKIP';
+        v_msg := 'Skipped (Aurora PostgreSQL - not applicable).';
+    ELSIF v_source_ge_17 THEN
+        SELECT count(*) INTO v_count
+        FROM (
+            -- Subscriptions missing replication origin
+            SELECT s.subname AS item
+            FROM pg_catalog.pg_subscription s
+            LEFT JOIN pg_catalog.pg_replication_origin o
+                   ON o.roname = 'pg_' || s.oid::text
+            WHERE o.roname IS NULL
+            UNION ALL
+            -- Subscription relations not in i/r state
+            SELECT s.subname || '.' || c.relname
+            FROM pg_catalog.pg_subscription_rel r
+            JOIN pg_catalog.pg_subscription s ON r.srsubid = s.oid
+            JOIN pg_catalog.pg_class c        ON r.srrelid = c.oid
+            WHERE r.srsubstate NOT IN ('i', 'r')
+        ) sub;
+        IF v_count > 0 THEN
+            v_status := '❌ FAILED';
+            v_msg := v_count || ' subscription issue(s) found. Fix before upgrade.';
+            SELECT string_agg(item, E'\n    ')
+            INTO v_detail
+            FROM (
+                SELECT s.subname || ': missing replication origin' AS item
+                FROM pg_catalog.pg_subscription s
+                LEFT JOIN pg_catalog.pg_replication_origin o
+                       ON o.roname = 'pg_' || s.oid::text
+                WHERE o.roname IS NULL
+                UNION ALL
+                SELECT s.subname || '.' || c.relname || ': state=' || r.srsubstate::text
+                FROM pg_catalog.pg_subscription_rel r
+                JOIN pg_catalog.pg_subscription s ON r.srsubid = s.oid
+                JOIN pg_catalog.pg_class c        ON r.srrelid = c.oid
+                WHERE r.srsubstate NOT IN ('i', 'r')
+            ) sub;
+        ELSE
+            v_status := '✓ PASSED';
+            v_msg := 'All subscriptions have valid origins and relation states.';
+        END IF;
+    ELSE
+        v_status := '- SKIP';
+        v_msg := 'Skipped (source version < 17).';
+    END IF;
+    RAISE NOTICE '%: %', v_status, v_msg;
+    IF v_detail IS NOT NULL AND v_detail != '' THEN
+        RAISE NOTICE '  Detail:'; RAISE NOTICE '    %', v_detail;
+    END IF;
+    check_id := '48'; check_scope := 'per-database'; status := v_status; message := v_msg; detail := v_detail;
+    RETURN NEXT;
+    RAISE NOTICE '';
+
+    -- --------------------------------------------
+    -- Check 49. check_for_isn_and_int8_passing_mismatch [per-database]
+    -- (All versions; contrib/isn relies on int8 pass-by-value behavior.
+    --  On RDS the old/new clusters normally have the same setting,
+    --  but we flag if contrib/isn is installed as informational.)
+    -- --------------------------------------------
+    v_detail := '';
+    RAISE NOTICE '=== 49. check_for_isn_and_int8_passing_mismatch [per-database] ===';
+    IF v_is_aurora THEN
+        v_status := '- SKIP';
+        v_msg := 'Skipped (Aurora PostgreSQL - not applicable).';
+    ELSE
+    SELECT count(*) INTO v_count
+    FROM pg_catalog.pg_proc p
+    WHERE p.probin = '$libdir/isn';
+    IF v_count > 0 THEN
+        v_status := '⚠️ WARNING';
+        v_msg := v_count || ' contrib/isn function(s) found. If old/new clusters disagree on float8_pass_by_value, pg_upgrade will fail. On RDS this is normally consistent, but verify before upgrading.';
+        SELECT string_agg(n.nspname || '.' || p.proname, E'\n    ' ORDER BY n.nspname, p.proname)
+        INTO v_detail
+        FROM pg_catalog.pg_proc p
+        JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
+        WHERE p.probin = '$libdir/isn';
+    ELSE
+        v_status := '✓ PASSED';
+        v_msg := 'No contrib/isn functions found.';
+    END IF;
+    END IF;
+    RAISE NOTICE '%: %', v_status, v_msg;
+    IF v_detail IS NOT NULL AND v_detail != '' THEN
+        RAISE NOTICE '  Detail:'; RAISE NOTICE '    %', v_detail;
+    END IF;
+    check_id := '49'; check_scope := 'per-database'; status := v_status; message := v_msg; detail := v_detail;
+    RETURN NEXT;
+    RAISE NOTICE '';
+
+    -- --------------------------------------------
+    -- Check 50. check_for_not_null_inheritance [per-database]
+    -- (target >= 18; child tables must not omit NOT NULL constraints
+    --  that parents have)
+    -- --------------------------------------------
+    v_detail := '';
+    RAISE NOTICE '=== 50. check_for_not_null_inheritance [per-database] ===';
+    IF v_is_aurora THEN
+        v_status := '- SKIP';
+        v_msg := 'Skipped (Aurora PostgreSQL - not applicable).';
+    ELSIF v_target_ge_18 THEN
+        SELECT count(*) INTO v_count
+        FROM pg_catalog.pg_inherits i
+        JOIN pg_catalog.pg_attribute ac ON ac.attrelid = i.inhrelid
+        JOIN pg_catalog.pg_attribute ap ON ap.attrelid = i.inhparent AND ap.attname = ac.attname
+        WHERE ap.attnum > 0
+          AND ap.attnotnull
+          AND NOT ac.attnotnull;
+        IF v_count > 0 THEN
+            v_status := '❌ FAILED';
+            v_msg := v_count || ' NOT NULL inheritance inconsistency(ies). Child columns missing NOT NULL that parent has. Fix with ALTER TABLE child ALTER COLUMN col SET NOT NULL.';
+            SELECT string_agg(nc.nspname || '.' || cc.relname || '.' || ac.attname, E'\n    ')
+            INTO v_detail
+            FROM pg_catalog.pg_inherits i
+            JOIN pg_catalog.pg_attribute ac ON ac.attrelid = i.inhrelid
+            JOIN pg_catalog.pg_attribute ap ON ap.attrelid = i.inhparent AND ap.attname = ac.attname
+            JOIN pg_catalog.pg_class cc ON cc.oid = ac.attrelid
+            JOIN pg_catalog.pg_namespace nc ON nc.oid = cc.relnamespace
+            WHERE ap.attnum > 0
+              AND ap.attnotnull
+              AND NOT ac.attnotnull;
+        ELSE
+            v_status := '✓ PASSED';
+            v_msg := 'No NOT NULL inheritance inconsistencies.';
+        END IF;
+    ELSE
+        v_status := '- SKIP';
+        v_msg := 'Skipped (target < 18).';
+    END IF;
+    RAISE NOTICE '%: %', v_status, v_msg;
+    IF v_detail IS NOT NULL AND v_detail != '' THEN
+        RAISE NOTICE '  Detail:'; RAISE NOTICE '    %', v_detail;
+    END IF;
+    check_id := '50'; check_scope := 'per-database'; status := v_status; message := v_msg; detail := v_detail;
+    RETURN NEXT;
+    RAISE NOTICE '';
+
+    -- --------------------------------------------
+    -- Check 51. check_for_unicode_update [per-database]
+    -- (source >= 17 AND target >= 18; WARNING only)
+    -- Surfaces indexes/partitions/constraints/matviews that use
+    -- Unicode-dependent functions which may produce different results
+    -- if the Unicode version changed between old and new clusters.
+    -- --------------------------------------------
+    v_detail := '';
+    RAISE NOTICE '=== 51. check_for_unicode_update [per-database] ===';
+    IF v_is_aurora THEN
+        v_status := '- SKIP';
+        v_msg := 'Skipped (Aurora PostgreSQL - not applicable).';
+    ELSIF v_source_ge_17 AND v_target_ge_18 THEN
+        SELECT count(*) INTO v_count
+        FROM (
+            SELECT ix.indexrelid AS reloid
+            FROM pg_catalog.pg_index ix
+            WHERE EXISTS (
+                SELECT 1 FROM pg_catalog.pg_proc f
+                JOIN pg_catalog.pg_namespace fn ON f.pronamespace = fn.oid
+                WHERE fn.nspname = 'pg_catalog'
+                  AND (f.proname IN ('normalize','unicode_assigned','unicode_version','is_normalized',
+                                     'lower','upper','initcap','casefold')
+                       OR f.proname LIKE 'regexp_%')
+                  AND (ix.indexprs::text LIKE '%:funcid ' || f.oid || ' %'
+                       OR ix.indpred::text LIKE '%:funcid ' || f.oid || ' %')
+            )
+            UNION ALL
+            SELECT pt.partrelid
+            FROM pg_catalog.pg_partitioned_table pt
+            WHERE EXISTS (
+                SELECT 1 FROM pg_catalog.pg_proc f
+                JOIN pg_catalog.pg_namespace fn ON f.pronamespace = fn.oid
+                WHERE fn.nspname = 'pg_catalog'
+                  AND (f.proname IN ('normalize','unicode_assigned','unicode_version','is_normalized',
+                                     'lower','upper','initcap','casefold')
+                       OR f.proname LIKE 'regexp_%')
+                  AND pt.partexprs::text LIKE '%:funcid ' || f.oid || ' %'
+            )
+            UNION ALL
+            SELECT co.conrelid
+            FROM pg_catalog.pg_constraint co
+            WHERE co.conbin IS NOT NULL
+              AND EXISTS (
+                  SELECT 1 FROM pg_catalog.pg_proc f
+                  JOIN pg_catalog.pg_namespace fn ON f.pronamespace = fn.oid
+                  WHERE fn.nspname = 'pg_catalog'
+                    AND (f.proname IN ('normalize','unicode_assigned','unicode_version','is_normalized',
+                                       'lower','upper','initcap','casefold')
+                         OR f.proname LIKE 'regexp_%')
+                    AND co.conbin::text LIKE '%:funcid ' || f.oid || ' %'
+              )
+        ) affected;
+        IF v_count > 0 THEN
+            v_status := '⚠️ WARNING';
+            v_msg := v_count || ' object(s) reference Unicode-dependent functions. If the Unicode version differs between old and new clusters, consider REINDEX or rebuilding affected objects after upgrade.';
+            SELECT string_agg(n.nspname || '.' || c.relname, E'\n    ')
+            INTO v_detail
+            FROM (
+                SELECT ix.indexrelid AS reloid
+                FROM pg_catalog.pg_index ix
+                WHERE EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_proc f
+                    JOIN pg_catalog.pg_namespace fn ON f.pronamespace = fn.oid
+                    WHERE fn.nspname = 'pg_catalog'
+                      AND (f.proname IN ('normalize','unicode_assigned','unicode_version','is_normalized',
+                                         'lower','upper','initcap','casefold')
+                           OR f.proname LIKE 'regexp_%')
+                      AND (ix.indexprs::text LIKE '%:funcid ' || f.oid || ' %'
+                           OR ix.indpred::text LIKE '%:funcid ' || f.oid || ' %')
+                )
+            ) sub
+            JOIN pg_catalog.pg_class c ON c.oid = sub.reloid
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            LIMIT 50;
+        ELSE
+            v_status := '✓ PASSED';
+            v_msg := 'No Unicode-dependent objects found.';
+        END IF;
+    ELSE
+        v_status := '- SKIP';
+        v_msg := 'Skipped (only meaningful when source >= 17 and target >= 18).';
+    END IF;
+    RAISE NOTICE '%: %', v_status, v_msg;
+    IF v_detail IS NOT NULL AND v_detail != '' THEN
+        RAISE NOTICE '  Detail:'; RAISE NOTICE '    %', v_detail;
+    END IF;
+    check_id := '51'; check_scope := 'per-database'; status := v_status; message := v_msg; detail := v_detail;
     RETURN NEXT;
     RAISE NOTICE '';
 

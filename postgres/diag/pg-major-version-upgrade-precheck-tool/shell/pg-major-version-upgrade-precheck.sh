@@ -67,6 +67,13 @@
 #   - Check 44: User-Defined Encoding Conversions (not supported in PG >= 14) - PG <= 14 only
 #   - Check 45: User-Defined Postfix Operators (not supported in PG >= 14) - PG <= 14 only
 #   - Check 46: Incompatible Polymorphic Functions (changed in PG 14) - PG <= 14 only
+#   - Check 47: Invalid Logical Replication Slots (PG >= 17 only)
+#   - Check 47b: Inactive Logical Slots with Unconsumed WAL (PG >= 17 only)
+#   - Check 47c: Active Logical Slots with WAL Lag (PG >= 17 only)
+#   - Check 48: Subscription State Check (PG >= 17 only)
+#   - Check 49: contrib/isn and int8 Passing Mismatch
+#   - Check 50: NOT NULL Inheritance Mismatch
+#   - Check 51: Unicode-Dependent Objects (PG >= 17 only)
 #
 # Version-Specific Checks: Automatically skipped when not applicable
 #   - Check 44: User-Defined Encoding Conversions (PG <= 13 only)
@@ -1967,7 +1974,7 @@ ${db_result}
     # Critical upgrade blockers should be ERROR, not WARNING, when issues are found
     local base_check="${check_name%% - what to check:*}"
     case "${base_check}" in
-        "chkpass Extension Check"|"tsearch2 Extension Check"|"pg_repack Extension Check"|"System-Defined Composite Types in User Tables"|"aclitem Data Type Check (PostgreSQL 16+ Incompatibility)"|"sql_identifier Data Type Check (PostgreSQL 12+ Incompatibility)"|"Removed Data Types Check (abstime, reltime, tinterval)"|"Tables WITH OIDS Check"|"User-Defined Encoding Conversions Check"|"User-Defined Postfix Operators Check"|"Incompatible Polymorphic Functions Check"|"reg* Data Types in User Tables Check"|"Database Connection Settings Check")
+        "chkpass Extension Check"|"tsearch2 Extension Check"|"pg_repack Extension Check"|"System-Defined Composite Types in User Tables"|"aclitem Data Type Check (PostgreSQL 16+ Incompatibility)"|"sql_identifier Data Type Check (PostgreSQL 12+ Incompatibility)"|"Removed Data Types Check (abstime, reltime, tinterval)"|"Tables WITH OIDS Check"|"User-Defined Encoding Conversions Check"|"User-Defined Postfix Operators Check"|"Incompatible Polymorphic Functions Check"|"reg* Data Types in User Tables Check"|"Database Connection Settings Check"|"Invalid Logical Replication Slots Check"|"Inactive Logical Slots with Unconsumed WAL Check"|"Subscription State Check"|"NOT NULL Inheritance Mismatch Check")
             if [ "${status}" = "WARNING" ]; then
                 status="ERROR"
             fi
@@ -3644,12 +3651,21 @@ EOF
     start_time_15d=$(date -u -v-15d +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d '15 days ago' +"%Y-%m-%dT%H:%M:%SZ")
     local start_time_2h
     start_time_2h=$(date -u -v-2H +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d '2 hours ago' +"%Y-%m-%dT%H:%M:%SZ")    
+
+    # Determine the correct instance identifier for CloudWatch instance-level metrics
+    # For Aurora cluster input: use writer instance; for instance input: use as-is
+    local cw_instance_id="${DB_IDENTIFIER}"
+    if [ "$is_aurora" = true ] && [ -n "${actual_instance_id:-}" ] && [ "$actual_instance_id" != "$DB_IDENTIFIER" ]; then
+        cw_instance_id="${actual_instance_id}"
+        echo "  CloudWatch instance-level metrics will use writer instance: ${cw_instance_id}"
+    fi
+
     # Check if we have 15-day data available
     local test_metric_data
     test_metric_data=$(aws cloudwatch get-metric-statistics \
         --namespace AWS/RDS \
         --metric-name "CPUUtilization" \
-        --dimensions Name=DBInstanceIdentifier,Value="${DB_IDENTIFIER}" \
+        --dimensions Name=DBInstanceIdentifier,Value="${cw_instance_id}" \
         --start-time "${start_time_15d}" \
         --end-time "${end_time}" \
         --period 86400 \
@@ -3677,7 +3693,7 @@ EOF
     memory_data=$(aws cloudwatch get-metric-statistics \
         --namespace AWS/RDS \
         --metric-name "FreeableMemory" \
-        --dimensions Name=DBInstanceIdentifier,Value="${DB_IDENTIFIER}" \
+        --dimensions Name=DBInstanceIdentifier,Value="${cw_instance_id}" \
         --start-time "${start_time}" \
         --end-time "${end_time}" \
         --period ${period} \
@@ -3786,7 +3802,7 @@ EOF
     cpu_data=$(aws cloudwatch get-metric-statistics \
         --namespace AWS/RDS \
         --metric-name "CPUUtilization" \
-        --dimensions Name=DBInstanceIdentifier,Value="${DB_IDENTIFIER}" \
+        --dimensions Name=DBInstanceIdentifier,Value="${cw_instance_id}" \
         --start-time "${start_time}" \
         --end-time "${end_time}" \
         --period ${period} \
@@ -3820,7 +3836,7 @@ EOF
     conn_data=$(aws cloudwatch get-metric-statistics \
         --namespace AWS/RDS \
         --metric-name "DatabaseConnections" \
-        --dimensions Name=DBInstanceIdentifier,Value="${DB_IDENTIFIER}" \
+        --dimensions Name=DBInstanceIdentifier,Value="${cw_instance_id}" \
         --start-time "${start_time}" \
         --end-time "${end_time}" \
         --period ${period} \
@@ -4080,6 +4096,25 @@ add_cloudwatch_metrics() {
     
     echo "Fetching CloudWatch metrics for the last 15 days..."
     
+    # Determine the correct instance identifier for CloudWatch instance-level metrics
+    # For Aurora cluster input: use writer instance; for instance input: use as-is
+    local cw_instance_id="${DB_IDENTIFIER}"
+    if [ "$ENGINE_TYPE" == "aurora-postgresql" ]; then
+        local cw_cluster_info
+        cw_cluster_info=$(aws rds describe-db-clusters \
+            --db-cluster-identifier "${CLUSTER_IDENTIFIER}" \
+            --region "${AWS_REGION}" \
+            --profile "${AWS_PROFILE}" \
+            --output json 2>/dev/null)
+        if [ $? -eq 0 ] && echo "$cw_cluster_info" | jq empty 2>/dev/null; then
+            local cw_writer
+            cw_writer=$(echo "$cw_cluster_info" | jq -r '.DBClusters[0].DBClusterMembers[] | select(.IsClusterWriter == true) | .DBInstanceIdentifier' 2>/dev/null | head -1)
+            if [ -n "$cw_writer" ] && [ "$cw_writer" != "null" ]; then
+                cw_instance_id="$cw_writer"
+            fi
+        fi
+    fi
+
     # Calculate time range (15 days)
     local end_time
     end_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -4097,7 +4132,7 @@ add_cloudwatch_metrics() {
     test_metric_data=$(aws cloudwatch get-metric-statistics \
         --namespace AWS/RDS \
         --metric-name "CPUUtilization" \
-        --dimensions Name=DBInstanceIdentifier,Value="${DB_IDENTIFIER}" \
+        --dimensions Name=DBInstanceIdentifier,Value="${cw_instance_id}" \
         --start-time "${start_time_15d}" \
         --end-time "${end_time}" \
         --period 86400 \
@@ -4135,7 +4170,7 @@ EOF
         metric_data=$(aws cloudwatch get-metric-statistics \
             --namespace AWS/RDS \
             --metric-name "${metric_name}" \
-            --dimensions Name=DBInstanceIdentifier,Value="${DB_IDENTIFIER}" \
+            --dimensions Name=DBInstanceIdentifier,Value="${cw_instance_id}" \
             --start-time "${start_time}" \
             --end-time "${end_time}" \
             --period ${period} \
@@ -4871,6 +4906,13 @@ EOF
         # Detect PostgreSQL major version for version-specific checks
         get_pg_major_version
         
+        # Detect if this is Aurora PostgreSQL (for skipping checks 47-51)
+        IS_AURORA=$(PGPASSWORD="${DB_PASS}" psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" -d "${DB_NAME}" -t -A -c "SELECT (to_regproc('aurora_version') IS NOT NULL)::text;" 2>/dev/null)
+        IS_AURORA=${IS_AURORA:-false}
+        if [ "$IS_AURORA" = "true" ]; then
+            echo "Detected: Aurora PostgreSQL (Checks 47-51 will be skipped)"
+        fi
+        
         # Check 1: PostgreSQL Version
         execute_check \
             "PostgreSQL Version Check" \
@@ -5375,15 +5417,14 @@ $(echo -e "${recommendations}" | sed 's/^/  /')
             JOIN pg_catalog.pg_attribute a ON c.oid = a.attrelid 
             WHERE NOT a.attisdropped 
                 AND a.atttypid IN ( 
-                    'pg_catalog.regproc'::pg_catalog.regtype, 
-                    'pg_catalog.regprocedure'::pg_catalog.regtype, 
-                    'pg_catalog.regoper'::pg_catalog.regtype, 
-                    'pg_catalog.regoperator'::pg_catalog.regtype, 
-                    'pg_catalog.regconfig'::pg_catalog.regtype, 
-                    'pg_catalog.regcollation'::pg_catalog.regtype, 
-                    'pg_catalog.regnamespace'::pg_catalog.regtype, 
-                    'pg_catalog.regdictionary'::pg_catalog.regtype 
+                    SELECT t.oid FROM pg_catalog.pg_type t
+                    WHERE t.typnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'pg_catalog')
+                      AND t.typname IN ('regcollation','regconfig','regdictionary','regnamespace',
+                                        'regoper','regoperator','regproc','regprocedure')
                 ) 
+                AND c.relkind IN ('r', 'm', 'i')
+                AND n.nspname !~ '^pg_temp_'
+                AND n.nspname !~ '^pg_toast_temp_'
                 AND n.nspname NOT IN ('pg_catalog', 'information_schema');
             -- Check for unsupported reg* data types 
             SELECT 
@@ -5396,15 +5437,14 @@ $(echo -e "${recommendations}" | sed 's/^/  /')
             JOIN pg_catalog.pg_attribute a ON c.oid = a.attrelid 
             WHERE NOT a.attisdropped 
                 AND a.atttypid IN ( 
-                    'pg_catalog.regproc'::pg_catalog.regtype, 
-                    'pg_catalog.regprocedure'::pg_catalog.regtype, 
-                    'pg_catalog.regoper'::pg_catalog.regtype, 
-                    'pg_catalog.regoperator'::pg_catalog.regtype, 
-                    'pg_catalog.regconfig'::pg_catalog.regtype, 
-                    'pg_catalog.regcollation'::pg_catalog.regtype, 
-                    'pg_catalog.regnamespace'::pg_catalog.regtype, 
-                    'pg_catalog.regdictionary'::pg_catalog.regtype 
+                    SELECT t.oid FROM pg_catalog.pg_type t
+                    WHERE t.typnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'pg_catalog')
+                      AND t.typname IN ('regcollation','regconfig','regdictionary','regnamespace',
+                                        'regoper','regoperator','regproc','regprocedure')
                 ) 
+                AND c.relkind IN ('r', 'm', 'i')
+                AND n.nspname !~ '^pg_temp_'
+                AND n.nspname !~ '^pg_toast_temp_'
                 AND n.nspname NOT IN ('pg_catalog', 'information_schema') 
             ORDER BY n.nspname, c.relname, a.attname;" \
             "${output_file}" \
@@ -6321,6 +6361,193 @@ Details: ${upgrade_targets}"
                 "46"
         else
             echo "Skipping Check 46 (Incompatible Polymorphic Functions) - Not applicable for PostgreSQL > 14"
+        fi
+        
+        # Check 47: Invalid Logical Replication Slots - Only for PG >= 17
+        if [ "$IS_AURORA" = "true" ]; then
+            echo "Skipping Check 47 (Invalid Logical Replication Slots) - Not applicable for Aurora PostgreSQL"
+        elif [ "$PG_MAJOR_VERSION" -ge 17 ]; then
+            execute_check_all_dbs \
+                "Invalid Logical Replication Slots Check - what to check: \"Your installation contains invalidated logical replication slots. These slots cannot be migrated during pg_upgrade. Drop them before upgrading.\"" \
+                "Check for logical replication slots with invalidation_reason IS NOT NULL (PostgreSQL >= 17 slot migration)" \
+                "SELECT 
+                    slot_name,
+                    plugin,
+                    database,
+                    invalidation_reason,
+                    'CRITICAL - Invalid logical slot cannot be migrated' AS issue
+                FROM pg_catalog.pg_replication_slots
+                WHERE slot_type = 'logical'
+                  AND temporary = false
+                  AND invalidation_reason IS NOT NULL
+                ORDER BY slot_name;" \
+                "${output_file}" \
+                "47"
+        else
+            echo "Skipping Check 47 (Invalid Logical Replication Slots) - Not applicable for PostgreSQL < 17"
+        fi
+        
+        # Check 47b: Inactive Logical Slots with Unconsumed WAL - Only for PG >= 17
+        if [ "$IS_AURORA" = "true" ]; then
+            echo "Skipping Check 47b (Inactive Logical Slots with Unconsumed WAL) - Not applicable for Aurora PostgreSQL"
+        elif [ "$PG_MAJOR_VERSION" -ge 17 ]; then
+            execute_check_all_dbs \
+                "Inactive Logical Slots with Unconsumed WAL Check - what to check: \"Your installation contains inactive logical replication slots with unconsumed WAL. After shutdown, pg_upgrade will reject these. Either consume pending WAL or drop the slot(s).\"" \
+                "Check for inactive logical slots that have not consumed all WAL (PostgreSQL >= 17 slot migration)" \
+                "SELECT 
+                    slot_name,
+                    plugin,
+                    database,
+                    confirmed_flush_lsn,
+                    pg_current_wal_insert_lsn() AS current_wal_insert_lsn,
+                    pg_size_pretty(pg_current_wal_insert_lsn() - confirmed_flush_lsn) AS wal_lag,
+                    'CRITICAL - Inactive slot with unconsumed WAL will block pg_upgrade' AS issue
+                FROM pg_catalog.pg_replication_slots
+                WHERE slot_type = 'logical'
+                  AND temporary = false
+                  AND active = false
+                  AND invalidation_reason IS NULL
+                  AND confirmed_flush_lsn < pg_current_wal_insert_lsn()
+                ORDER BY slot_name;" \
+                "${output_file}" \
+                "47b"
+        else
+            echo "Skipping Check 47b (Inactive Logical Slots with Unconsumed WAL) - Not applicable for PostgreSQL < 17"
+        fi
+        
+        # Check 47c: Active Logical Slots with WAL Lag - Only for PG >= 17 (WARNING only)
+        if [ "$IS_AURORA" = "true" ]; then
+            echo "Skipping Check 47c (Active Logical Slots with WAL Lag) - Not applicable for Aurora PostgreSQL"
+        elif [ "$PG_MAJOR_VERSION" -ge 17 ]; then
+            execute_check_all_dbs \
+                "Active Logical Slots with WAL Lag Check" \
+                "Check for active logical slots with WAL lag - ensure consumers are caught up before stopping for upgrade (PostgreSQL >= 17)" \
+                "SELECT 
+                    slot_name,
+                    plugin,
+                    database,
+                    confirmed_flush_lsn,
+                    pg_current_wal_insert_lsn() AS current_wal_insert_lsn,
+                    pg_size_pretty(pg_current_wal_insert_lsn() - confirmed_flush_lsn) AS wal_lag,
+                    'WARNING - Active slot with WAL lag; ensure consumer catches up before upgrade' AS issue
+                FROM pg_catalog.pg_replication_slots
+                WHERE slot_type = 'logical'
+                  AND temporary = false
+                  AND active = true
+                  AND invalidation_reason IS NULL
+                  AND confirmed_flush_lsn < pg_current_wal_insert_lsn()
+                ORDER BY slot_name;" \
+                "${output_file}" \
+                "47c"
+        else
+            echo "Skipping Check 47c (Active Logical Slots with WAL Lag) - Not applicable for PostgreSQL < 17"
+        fi
+        
+        # Check 48: Subscription State Check - Only for PG >= 17
+        if [ "$IS_AURORA" = "true" ]; then
+            echo "Skipping Check 48 (Subscription State Check) - Not applicable for Aurora PostgreSQL"
+        elif [ "$PG_MAJOR_VERSION" -ge 17 ]; then
+            execute_check_all_dbs \
+                "Subscription State Check - what to check: \"Your installation contains subscriptions without replication origin or having relations not in i (initialize) or r (ready) state. Fix before upgrading.\"" \
+                "Check subscription replication origins and relation states for pg_upgrade compatibility (PostgreSQL >= 17)" \
+                "SELECT s.subname AS subscription, '(missing replication origin)' AS issue
+                FROM pg_catalog.pg_subscription s
+                LEFT JOIN pg_catalog.pg_replication_origin o
+                       ON o.roname = 'pg_' || s.oid::text
+                WHERE o.roname IS NULL
+                UNION ALL
+                SELECT s.subname || '.' || c.relname, 'state=' || r.srsubstate::text
+                FROM pg_catalog.pg_subscription_rel r
+                JOIN pg_catalog.pg_subscription s ON r.srsubid = s.oid
+                JOIN pg_catalog.pg_class c        ON r.srrelid = c.oid
+                WHERE r.srsubstate NOT IN ('i', 'r')
+                ORDER BY 1;" \
+                "${output_file}" \
+                "48"
+        else
+            echo "Skipping Check 48 (Subscription State Check) - Not applicable for PostgreSQL < 17"
+        fi
+        
+        # Check 49: contrib/isn and int8 Passing Mismatch (all versions, WARNING)
+        if [ "$IS_AURORA" = "true" ]; then
+            echo "Skipping Check 49 (contrib/isn Extension) - Not applicable for Aurora PostgreSQL"
+        else
+        execute_check_all_dbs \
+            "contrib/isn Extension Check" \
+            "Check for contrib/isn functions - if old/new clusters disagree on float8_pass_by_value, pg_upgrade will fail. On RDS this is normally consistent." \
+            "SELECT 
+                n.nspname AS schema_name,
+                p.proname AS function_name,
+                'WARNING - contrib/isn function found; verify float8_pass_by_value consistency' AS issue
+            FROM pg_catalog.pg_proc p
+            JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
+            WHERE p.probin = '\$libdir/isn'
+            ORDER BY n.nspname, p.proname;" \
+            "${output_file}" \
+            "49"
+        fi
+        
+        # Check 50: NOT NULL Inheritance Mismatch (all versions)
+        if [ "$IS_AURORA" = "true" ]; then
+            echo "Skipping Check 50 (NOT NULL Inheritance Mismatch) - Not applicable for Aurora PostgreSQL"
+        else
+        execute_check_all_dbs \
+            "NOT NULL Inheritance Mismatch Check - what to check: \"Your installation contains child tables that omit NOT NULL constraints present in their parent tables. This will cause pg_upgrade to fail when upgrading to PostgreSQL 18+. Fix with: ALTER TABLE child ALTER COLUMN col SET NOT NULL.\"" \
+            "Check for child tables missing NOT NULL constraints that parent tables have" \
+            "SELECT 
+                nc.nspname AS schema_name,
+                cc.relname AS child_table,
+                ac.attname AS column_name,
+                np.nspname || '.' || cp.relname AS parent_table,
+                'CRITICAL - Child missing NOT NULL that parent has' AS issue
+            FROM pg_catalog.pg_inherits i
+            JOIN pg_catalog.pg_attribute ac ON ac.attrelid = i.inhrelid
+            JOIN pg_catalog.pg_attribute ap ON ap.attrelid = i.inhparent AND ap.attname = ac.attname
+            JOIN pg_catalog.pg_class cc ON cc.oid = i.inhrelid
+            JOIN pg_catalog.pg_namespace nc ON nc.oid = cc.relnamespace
+            JOIN pg_catalog.pg_class cp ON cp.oid = i.inhparent
+            JOIN pg_catalog.pg_namespace np ON np.oid = cp.relnamespace
+            WHERE ap.attnum > 0
+              AND ap.attnotnull
+              AND NOT ac.attnotnull
+            ORDER BY nc.nspname, cc.relname, ac.attname;" \
+            "${output_file}" \
+            "50"
+        fi
+        
+        # Check 51: Unicode-Dependent Objects - Only for PG >= 17 (WARNING only)
+        if [ "$IS_AURORA" = "true" ]; then
+            echo "Skipping Check 51 (Unicode-Dependent Objects) - Not applicable for Aurora PostgreSQL"
+        elif [ "$PG_MAJOR_VERSION" -ge 17 ]; then
+            execute_check_all_dbs \
+                "Unicode-Dependent Objects Check" \
+                "Check for indexes/partitions/constraints using Unicode-dependent functions (lower, upper, initcap, regexp_*). If Unicode version differs between old and new clusters, consider REINDEX after upgrade." \
+                "SELECT 
+                    n.nspname AS schema_name,
+                    c.relname AS relation_name,
+                    ic.relname AS index_name,
+                    'WARNING - Expression index uses Unicode-dependent function' AS issue
+                FROM pg_catalog.pg_index ix
+                JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid
+                JOIN pg_catalog.pg_class c  ON c.oid  = ix.indrelid
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                WHERE ix.indexprs IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM pg_catalog.pg_proc f
+                      JOIN pg_catalog.pg_namespace fn ON f.pronamespace = fn.oid
+                      WHERE fn.nspname = 'pg_catalog'
+                        AND (f.proname IN ('normalize','unicode_assigned','unicode_version','is_normalized',
+                                           'lower','upper','initcap','casefold')
+                             OR f.proname LIKE 'regexp_%')
+                        AND (ix.indexprs::text LIKE '%:funcid ' || f.oid || ' %'
+                             OR ix.indpred::text LIKE '%:funcid ' || f.oid || ' %')
+                  )
+                ORDER BY n.nspname, c.relname, ic.relname
+                LIMIT 50;" \
+                "${output_file}" \
+                "51"
+        else
+            echo "Skipping Check 51 (Unicode-Dependent Objects) - Not applicable for PostgreSQL < 17"
         fi
         
         # Close the checks table (HTML only)
