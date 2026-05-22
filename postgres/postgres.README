@@ -93,7 +93,7 @@ pg-major-version-upgrade-precheck.sh            :   Aurora/RDS PostgreSQL Major 
                                         Prerequisites:
                                             bash 4.0+, psql, aws cli (for RDS mode), jq
 
-                                        Tested on RDS PostgreSQL 11-17, Aurora PostgreSQL 11-17
+                                        Tested on RDS PostgreSQL 11-18, Aurora PostgreSQL 11-17
 
 wrapper.sh                          :   Batch execution wrapper for pg-major-version-upgrade-precheck.sh.
                                         Runs pre-upgrade checks against multiple PostgreSQL databases
@@ -122,7 +122,7 @@ wrapper.sh                          :   Batch execution wrapper for pg-major-ver
                                             bash 4.0+, psql, aws cli, jq
                                             pg-major-version-upgrade-precheck.sh in the same directory
 
-                                        Tested on RDS PostgreSQL 11-17, Aurora PostgreSQL 11-17
+                                        Tested on RDS PostgreSQL 11-18, Aurora PostgreSQL 11-17
 
 ################################################################################
 rds-support-tools/postgres/diag/pg-major-version-upgrade-precheck-tool/sql/
@@ -148,7 +148,7 @@ pg-major-version-upgrade-precheck-sql.sql                :   Aurora/RDS PostgreS
                                                             Prerequisites:
                                                                 Any PostgreSQL client (psql. etc.)
 
-                                                            Tested on RDS PostgreSQL 11-17, Aurora PostgreSQL 11-17
+                                                            Tested on RDS PostgreSQL 11-18, Aurora PostgreSQL 11-17
 
 ################################################################################
 rds-support-tools/postgres/diag/pg-major-version-upgrade-precheck-tool/plpgsql/
@@ -182,7 +182,7 @@ pg-major-version-upgrade-precheck-plpgsql.sql            :   Aurora/RDS PostgreS
                                                             Prerequisites:
                                                                 Any PostgreSQL client (psql. etc.)
 
-                                                            Tested on RDS PostgreSQL 11-17, Aurora PostgreSQL 11-17
+                                                            Tested on RDS PostgreSQL 11-18, Aurora PostgreSQL 11-17
 
 #####################################
 rds-support-tools/postgres/diag/proc
