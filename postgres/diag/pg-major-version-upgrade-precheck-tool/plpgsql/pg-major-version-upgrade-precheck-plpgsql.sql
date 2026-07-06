@@ -101,7 +101,6 @@ DECLARE
     v_source_le_11      boolean;
     v_source_le_13      boolean;
     v_source_ge_17      boolean;
-    v_is_aurora         boolean;
 BEGIN
     -- Prevent runaway queries from holding catalog locks too long
     SET LOCAL statement_timeout = 600000;   -- 10 minutes
@@ -146,12 +145,6 @@ BEGIN
     -- Validate target_version is within supported range (11-18)
     IF p_target_version < 11 OR p_target_version > 18 THEN
         RAISE EXCEPTION 'ERROR: Target version must be between 11 and 18. Got: %', p_target_version;
-    END IF;
-
-    -- Aurora PostgreSQL does not yet support target version 18
-    v_is_aurora := (to_regproc('aurora_version') IS NOT NULL);
-    IF v_is_aurora AND p_target_version >= 18 THEN
-        RAISE EXCEPTION 'ERROR: Aurora PostgreSQL does not support target version 18 yet. Supported: 11-17.';
     END IF;
 
     -- Version sanity check
@@ -1983,10 +1976,7 @@ BEGIN
     -- --------------------------------------------
     v_detail := '';
     RAISE NOTICE '=== 47. check_old_cluster_for_valid_slots - invalid slots [global] ===';
-    IF v_is_aurora THEN
-        v_status := '- SKIP';
-        v_msg := 'Skipped (Aurora PostgreSQL - not applicable).';
-    ELSIF v_source_ge_17 THEN
+    IF v_source_ge_17 THEN
         SELECT count(*) INTO v_count
         FROM pg_catalog.pg_replication_slots
         WHERE slot_type = 'logical'
@@ -2023,10 +2013,7 @@ BEGIN
     -- --------------------------------------------
     v_detail := '';
     RAISE NOTICE '=== 47b. check_old_cluster_for_valid_slots - unconsumed WAL [global] ===';
-    IF v_is_aurora THEN
-        v_status := '- SKIP';
-        v_msg := 'Skipped (Aurora PostgreSQL - not applicable).';
-    ELSIF v_source_ge_17 THEN
+    IF v_source_ge_17 THEN
         SELECT count(*) INTO v_count
         FROM pg_catalog.pg_replication_slots
         WHERE slot_type = 'logical'
@@ -2067,10 +2054,7 @@ BEGIN
     -- --------------------------------------------
     v_detail := '';
     RAISE NOTICE '=== 47c. check_old_cluster_for_valid_slots - active slots with WAL lag [global] ===';
-    IF v_is_aurora THEN
-        v_status := '- SKIP';
-        v_msg := 'Skipped (Aurora PostgreSQL - not applicable).';
-    ELSIF v_source_ge_17 THEN
+    IF v_source_ge_17 THEN
         SELECT count(*) INTO v_count
         FROM pg_catalog.pg_replication_slots
         WHERE slot_type = 'logical'
@@ -2112,10 +2096,7 @@ BEGIN
     -- --------------------------------------------
     v_detail := '';
     RAISE NOTICE '=== 48. check_old_cluster_subscription_state [per-database] ===';
-    IF v_is_aurora THEN
-        v_status := '- SKIP';
-        v_msg := 'Skipped (Aurora PostgreSQL - not applicable).';
-    ELSIF v_source_ge_17 THEN
+    IF v_source_ge_17 THEN
         SELECT count(*) INTO v_count
         FROM (
             -- Subscriptions missing replication origin
@@ -2169,21 +2150,18 @@ BEGIN
     -- --------------------------------------------
     -- Check 49. check_for_isn_and_int8_passing_mismatch [per-database]
     -- (All versions; contrib/isn relies on int8 pass-by-value behavior.
-    --  On RDS the old/new clusters normally have the same setting,
+    --  On RDS/Aurora the old/new clusters normally have the same setting,
     --  but we flag if contrib/isn is installed as informational.)
     -- --------------------------------------------
     v_detail := '';
     RAISE NOTICE '=== 49. check_for_isn_and_int8_passing_mismatch [per-database] ===';
-    IF v_is_aurora THEN
-        v_status := '- SKIP';
-        v_msg := 'Skipped (Aurora PostgreSQL - not applicable).';
-    ELSE
+
     SELECT count(*) INTO v_count
     FROM pg_catalog.pg_proc p
     WHERE p.probin = '$libdir/isn';
     IF v_count > 0 THEN
         v_status := '⚠️ WARNING';
-        v_msg := v_count || ' contrib/isn function(s) found. If old/new clusters disagree on float8_pass_by_value, pg_upgrade will fail. On RDS this is normally consistent, but verify before upgrading.';
+        v_msg := v_count || ' contrib/isn function(s) found. If old/new clusters disagree on float8_pass_by_value, pg_upgrade will fail. On RDS/Aurora this is normally consistent, but verify before upgrading.';
         SELECT string_agg(n.nspname || '.' || p.proname, E'\n    ' ORDER BY n.nspname, p.proname)
         INTO v_detail
         FROM pg_catalog.pg_proc p
@@ -2193,7 +2171,7 @@ BEGIN
         v_status := '✓ PASSED';
         v_msg := 'No contrib/isn functions found.';
     END IF;
-    END IF;
+
     RAISE NOTICE '%: %', v_status, v_msg;
     IF v_detail IS NOT NULL AND v_detail != '' THEN
         RAISE NOTICE '  Detail:'; RAISE NOTICE '    %', v_detail;
@@ -2209,10 +2187,7 @@ BEGIN
     -- --------------------------------------------
     v_detail := '';
     RAISE NOTICE '=== 50. check_for_not_null_inheritance [per-database] ===';
-    IF v_is_aurora THEN
-        v_status := '- SKIP';
-        v_msg := 'Skipped (Aurora PostgreSQL - not applicable).';
-    ELSIF v_target_ge_18 THEN
+    IF v_target_ge_18 THEN
         SELECT count(*) INTO v_count
         FROM pg_catalog.pg_inherits i
         JOIN pg_catalog.pg_attribute ac ON ac.attrelid = i.inhrelid
@@ -2258,10 +2233,7 @@ BEGIN
     -- --------------------------------------------
     v_detail := '';
     RAISE NOTICE '=== 51. check_for_unicode_update [per-database] ===';
-    IF v_is_aurora THEN
-        v_status := '- SKIP';
-        v_msg := 'Skipped (Aurora PostgreSQL - not applicable).';
-    ELSIF v_source_ge_17 AND v_target_ge_18 THEN
+    IF v_source_ge_17 AND v_target_ge_18 THEN
         SELECT count(*) INTO v_count
         FROM (
             SELECT ix.indexrelid AS reloid
