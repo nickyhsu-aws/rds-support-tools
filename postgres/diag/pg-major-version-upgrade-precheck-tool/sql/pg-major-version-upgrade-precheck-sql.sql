@@ -122,8 +122,7 @@ SELECT
   (current_setting('server_version_num')::int / 10000 <= 15
      AND :target_version >= 16)::text                                             AS need_aclitem_check,
   (current_setting('server_version_num')::int / 10000 <= 11)::text               AS source_le_11,
-  (current_setting('server_version_num')::int / 10000 <= 13)::text               AS source_le_13,
-  (to_regproc('aurora_version') IS NOT NULL)::text                               AS is_aurora
+  (current_setting('server_version_num')::int / 10000 <= 13)::text               AS source_le_13
 \gset
 
 -- Version sanity check
@@ -138,16 +137,6 @@ SELECT
 SELECT (:target_version < 11 OR :target_version > 18)::text AS version_out_of_range \gset
 \if :version_out_of_range
     \echo '❌ FAILED: target_version must be between 11 and 18.'
-    \quit
-\endif
-
--- ============================================
--- Aurora PostgreSQL does not yet support target version 18
--- ============================================
-SELECT (to_regproc('aurora_version') IS NOT NULL AND :target_version >= 18)::text AS aurora_target_invalid \gset
-\if :aurora_target_invalid
-    \echo '❌ FAILED: Aurora PostgreSQL does not support target version 18 yet.'
-    \echo '   Supported target versions for Aurora PostgreSQL: 11-17'
     \quit
 \endif
 
@@ -1840,13 +1829,9 @@ FROM (
 -- --------------------------------------------
 -- Check 47. check_old_cluster_for_valid_slots - invalid slots [global]
 -- (source >= 17; logical slot migration requires valid slots)
--- (Skipped for Aurora PostgreSQL - Aurora handles slot migration internally)
 -- --------------------------------------------
 \echo '=== 47. check_old_cluster_for_valid_slots - invalid slots [global] ==='
-\if :is_aurora
-    SELECT 'false' AS c47_failed \gset
-    \echo '- Skipped (Aurora PostgreSQL - not applicable)'
-\elif :source_ge_17
+\if :source_ge_17
     SELECT (count(*) > 0)::text AS c47_failed,
            CASE WHEN count(*) > 0
                 THEN '❌ FAILED: ' || count(*) || ' invalidated logical slot(s). Drop them before upgrade.'
@@ -1878,10 +1863,7 @@ FROM (
 -- (source >= 17; inactive slots must have consumed all WAL before shutdown)
 -- --------------------------------------------
 \echo '=== 47b. check_old_cluster_for_valid_slots - unconsumed WAL [global] ==='
-\if :is_aurora
-    SELECT 'false' AS c47b_failed \gset
-    \echo '- Skipped (Aurora PostgreSQL - not applicable)'
-\elif :source_ge_17
+\if :source_ge_17
     SELECT (count(*) > 0)::text AS c47b_failed,
            CASE WHEN count(*) > 0
                 THEN '❌ FAILED: ' || count(*) || ' inactive logical slot(s) with unconsumed WAL. '
@@ -1922,10 +1904,7 @@ FROM (
 -- (source >= 17; WARNING only - active slots with WAL lag may fail
 -- --------------------------------------------
 \echo '=== 47c. check_old_cluster_for_valid_slots - active slots with WAL lag [global] ==='
-\if :is_aurora
-    SELECT 'false' AS c47c_failed \gset
-    \echo '- Skipped (Aurora PostgreSQL - not applicable)'
-\elif :source_ge_17
+\if :source_ge_17
     SELECT (count(*) > 0)::text AS c47c_failed,
            CASE WHEN count(*) > 0
                 THEN '⚠️ WARNING: ' || count(*) || ' active logical slot(s) with WAL lag. '
@@ -1975,10 +1954,7 @@ FROM (
 --  and each subscription must have a replication origin)
 -- --------------------------------------------
 \echo '=== 48. check_old_cluster_subscription_state [per-database] ==='
-\if :is_aurora
-    SELECT 'false' AS c48_failed \gset
-    \echo '- Skipped (Aurora PostgreSQL - not applicable)'
-\elif :source_ge_17
+\if :source_ge_17
     SELECT (count(*) > 0)::text AS c48_failed,
            CASE WHEN count(*) > 0
                 THEN '❌ FAILED: ' || count(*) || ' subscription issue(s) found. Fix before upgrade.'
@@ -2034,15 +2010,11 @@ FROM (
 -- Check 49. check_for_isn_and_int8_passing_mismatch [per-database]
 -- --------------------------------------------
 \echo '=== 49. check_for_isn_and_int8_passing_mismatch [per-database] ==='
-\if :is_aurora
-    SELECT 'false' AS c49_failed \gset
-    \echo '- Skipped (Aurora PostgreSQL - not applicable)'
-\else
 SELECT (count(*) > 0)::text AS c49_failed,
        CASE WHEN count(*) > 0
             THEN '⚠️ WARNING: ' || count(*) || ' contrib/isn function(s) found. ' ||
                  'If old/new clusters disagree on float8_pass_by_value, pg_upgrade will fail. ' ||
-                 'On RDS this is normally consistent, but verify before upgrading.'
+                 'On RDS/Aurora this is normally consistent, but verify before upgrading.'
             ELSE '✓ PASSED'
        END AS c49_status
 FROM pg_catalog.pg_proc p
@@ -2057,7 +2029,6 @@ WHERE p.probin = '$libdir/isn' \gset
     WHERE p.probin = '$libdir/isn'
     ORDER BY n.nspname, p.proname;
 \endif
-\endif
 
 \echo ''
 
@@ -2067,10 +2038,7 @@ WHERE p.probin = '$libdir/isn' \gset
 -- Child tables must not omit NOT NULL constraints that parents have.
 -- --------------------------------------------
 \echo '=== 50. check_for_not_null_inheritance [per-database] ==='
-\if :is_aurora
-    SELECT 'false' AS c50_failed \gset
-    \echo '- Skipped (Aurora PostgreSQL - not applicable)'
-\elif :target_ge_18
+\if :target_ge_18
     SELECT (count(*) > 0)::text AS c50_failed,
            CASE WHEN count(*) > 0
                 THEN '❌ FAILED: ' || count(*) || ' child column(s) missing NOT NULL inherited from parent. ' ||
@@ -2118,10 +2086,6 @@ WHERE p.probin = '$libdir/isn' \gset
 -- if the Unicode version changed between old and new clusters.
 -- --------------------------------------------
 \echo '=== 51. check_for_unicode_update [per-database] ==='
-\if :is_aurora
-    SELECT 'false' AS c51_failed \gset
-    \echo '- Skipped (Aurora PostgreSQL - not applicable)'
-\else
 SELECT (:source_ge_17 = 'true' AND :target_ge_18 = 'true')::text AS need_c51 \gset
 \if :need_c51
     WITH
@@ -2235,7 +2199,6 @@ SELECT (:source_ge_17 = 'true' AND :target_ge_18 = 'true')::text AS need_c51 \gs
 \else
     SELECT 'false' AS c51_failed, '- SKIP' AS c51_status \gset
     \echo '- Skipped (only meaningful when source >= 17 and target >= 18)'
-\endif
 \endif
 
 \echo ''

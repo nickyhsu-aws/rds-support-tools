@@ -4906,13 +4906,6 @@ EOF
         # Detect PostgreSQL major version for version-specific checks
         get_pg_major_version
         
-        # Detect if this is Aurora PostgreSQL (for skipping checks 47-51)
-        IS_AURORA=$(PGPASSWORD="${DB_PASS}" psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" -d "${DB_NAME}" -t -A -c "SELECT (to_regproc('aurora_version') IS NOT NULL)::text;" 2>/dev/null)
-        IS_AURORA=${IS_AURORA:-false}
-        if [ "$IS_AURORA" = "true" ]; then
-            echo "Detected: Aurora PostgreSQL (Checks 47-51 will be skipped)"
-        fi
-        
         # Check 1: PostgreSQL Version
         execute_check \
             "PostgreSQL Version Check" \
@@ -6364,9 +6357,7 @@ Details: ${upgrade_targets}"
         fi
         
         # Check 47: Invalid Logical Replication Slots - Only for PG >= 17
-        if [ "$IS_AURORA" = "true" ]; then
-            echo "Skipping Check 47 (Invalid Logical Replication Slots) - Not applicable for Aurora PostgreSQL"
-        elif [ "$PG_MAJOR_VERSION" -ge 17 ]; then
+        if [ "$PG_MAJOR_VERSION" -ge 17 ]; then
             execute_check_all_dbs \
                 "Invalid Logical Replication Slots Check - what to check: \"Your installation contains invalidated logical replication slots. These slots cannot be migrated during pg_upgrade. Drop them before upgrading.\"" \
                 "Check for logical replication slots with invalidation_reason IS NOT NULL (PostgreSQL >= 17 slot migration)" \
@@ -6388,9 +6379,7 @@ Details: ${upgrade_targets}"
         fi
         
         # Check 47b: Inactive Logical Slots with Unconsumed WAL - Only for PG >= 17
-        if [ "$IS_AURORA" = "true" ]; then
-            echo "Skipping Check 47b (Inactive Logical Slots with Unconsumed WAL) - Not applicable for Aurora PostgreSQL"
-        elif [ "$PG_MAJOR_VERSION" -ge 17 ]; then
+        if [ "$PG_MAJOR_VERSION" -ge 17 ]; then
             execute_check_all_dbs \
                 "Inactive Logical Slots with Unconsumed WAL Check - what to check: \"Your installation contains inactive logical replication slots with unconsumed WAL. After shutdown, pg_upgrade will reject these. Either consume pending WAL or drop the slot(s).\"" \
                 "Check for inactive logical slots that have not consumed all WAL (PostgreSQL >= 17 slot migration)" \
@@ -6416,9 +6405,7 @@ Details: ${upgrade_targets}"
         fi
         
         # Check 47c: Active Logical Slots with WAL Lag - Only for PG >= 17 (WARNING only)
-        if [ "$IS_AURORA" = "true" ]; then
-            echo "Skipping Check 47c (Active Logical Slots with WAL Lag) - Not applicable for Aurora PostgreSQL"
-        elif [ "$PG_MAJOR_VERSION" -ge 17 ]; then
+        if [ "$PG_MAJOR_VERSION" -ge 17 ]; then
             execute_check_all_dbs \
                 "Active Logical Slots with WAL Lag Check" \
                 "Check for active logical slots with WAL lag - ensure consumers are caught up before stopping for upgrade (PostgreSQL >= 17)" \
@@ -6444,9 +6431,7 @@ Details: ${upgrade_targets}"
         fi
         
         # Check 48: Subscription State Check - Only for PG >= 17
-        if [ "$IS_AURORA" = "true" ]; then
-            echo "Skipping Check 48 (Subscription State Check) - Not applicable for Aurora PostgreSQL"
-        elif [ "$PG_MAJOR_VERSION" -ge 17 ]; then
+        if [ "$PG_MAJOR_VERSION" -ge 17 ]; then
             execute_check_all_dbs \
                 "Subscription State Check - what to check: \"Your installation contains subscriptions without replication origin or having relations not in i (initialize) or r (ready) state. Fix before upgrading.\"" \
                 "Check subscription replication origins and relation states for pg_upgrade compatibility (PostgreSQL >= 17)" \
@@ -6469,9 +6454,6 @@ Details: ${upgrade_targets}"
         fi
         
         # Check 49: contrib/isn and int8 Passing Mismatch (all versions, WARNING)
-        if [ "$IS_AURORA" = "true" ]; then
-            echo "Skipping Check 49 (contrib/isn Extension) - Not applicable for Aurora PostgreSQL"
-        else
         execute_check_all_dbs \
             "contrib/isn Extension Check" \
             "Check for contrib/isn functions - if old/new clusters disagree on float8_pass_by_value, pg_upgrade will fail. On RDS this is normally consistent." \
@@ -6485,12 +6467,8 @@ Details: ${upgrade_targets}"
             ORDER BY n.nspname, p.proname;" \
             "${output_file}" \
             "49"
-        fi
-        
+
         # Check 50: NOT NULL Inheritance Mismatch (all versions)
-        if [ "$IS_AURORA" = "true" ]; then
-            echo "Skipping Check 50 (NOT NULL Inheritance Mismatch) - Not applicable for Aurora PostgreSQL"
-        else
         execute_check_all_dbs \
             "NOT NULL Inheritance Mismatch Check - what to check: \"Your installation contains child tables that omit NOT NULL constraints present in their parent tables. This will cause pg_upgrade to fail when upgrading to PostgreSQL 18+. Fix with: ALTER TABLE child ALTER COLUMN col SET NOT NULL.\"" \
             "Check for child tables missing NOT NULL constraints that parent tables have" \
@@ -6513,12 +6491,9 @@ Details: ${upgrade_targets}"
             ORDER BY nc.nspname, cc.relname, ac.attname;" \
             "${output_file}" \
             "50"
-        fi
         
         # Check 51: Unicode-Dependent Objects - Only for PG >= 17 (WARNING only)
-        if [ "$IS_AURORA" = "true" ]; then
-            echo "Skipping Check 51 (Unicode-Dependent Objects) - Not applicable for Aurora PostgreSQL"
-        elif [ "$PG_MAJOR_VERSION" -ge 17 ]; then
+        if [ "$PG_MAJOR_VERSION" -ge 17 ]; then
             execute_check_all_dbs \
                 "Unicode-Dependent Objects Check" \
                 "Check for indexes/partitions/constraints using Unicode-dependent functions (lower, upper, initcap, regexp_*). If Unicode version differs between old and new clusters, consider REINDEX after upgrade." \
