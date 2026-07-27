@@ -5117,7 +5117,7 @@ EOF
         # Check 11: Table Bloat Estimation
         execute_check \
             "Table Bloat Analysis" \
-            "If a table is bloated, consider running VACUUM FULL or pg_repack, as bloated tables can significantly impact post-upgrade performance." \
+            "If a table is bloated, consider running VACUUM, as bloated tables can significantly impact post-upgrade performance." \
             "SELECT 
                 schemaname,
                 relname,
